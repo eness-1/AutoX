@@ -119,7 +119,7 @@ class McpService(private val context: Context) {
                 ToolDefinition(
                     name = "cancel_job",
                     title = "Cancel Job",
-                    description = "Cancel a running job.",
+                    description = "Cancel one running MCP job and wait for its script engine to stop.",
                     inputSchema = ToolSchemas.objectSchema(
                         mapOf("jobId" to ToolSchemas.intSchema("Job id.")),
                         required = listOf("jobId")

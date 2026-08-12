@@ -3,6 +3,7 @@ package com.stardust.autojs.servicecomponents
 import com.aiselp.autox.engine.NodeScriptEngine
 import com.stardust.autojs.AutoJs
 import com.stardust.autojs.execution.ExecutionConfig
+import com.stardust.autojs.execution.ScriptExecution
 import com.stardust.autojs.project.ProjectConfig
 import com.stardust.autojs.script.JavaScriptSource
 import com.stardust.autojs.script.ScriptFile
@@ -98,6 +99,25 @@ object EngineController {
                 override val isRunning: Boolean = false
             }, listener, config)
         }
+    }
+
+    /**
+     * Starts a script in the current process and returns the execution that owns its engine.
+     *
+     * Callers that need precise cancellation must retain this handle instead of routing the stop
+     * request through [serviceConnection], which controls the independent script process.
+     */
+    fun runScriptLocalTracked(
+        file: File,
+        listener: BinderScriptListener? = null,
+        config: ExecutionConfig? = null
+    ): ScriptExecution {
+        val source: ScriptSource = ScriptFile(file.path).toSource()
+        return AutoJs.instance.scriptEngineService.execute(
+            source,
+            listener?.toScriptExecutionListener(),
+            config ?: ExecutionConfig(workingDirectory = file.parent ?: "/")
+        )
     }
 
     fun getAllScriptTasks(): Deferred<MutableList<TaskInfo>> = scope.async {

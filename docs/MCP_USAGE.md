@@ -94,6 +94,13 @@ curl -X POST http://127.0.0.1:27190/mcp \
 ```
 
 - `cancel_job`
+
+`cancel_job(jobId)` 只停止该 MCP job 对应的脚本引擎。返回 `CANCELED` 表示引擎已经退出；
+未知 job 返回 `NotFound`，已自然完成的 job 返回 `AlreadyFinished`，停止超时返回
+`CancelTimeout` 并先保持 `CANCELING`，不会把未停止的脚本误报为已取消。同一 job 已有取消
+请求执行时返回 `CancelInProgress`。若引擎随后退出，后台观察器会把 job 自动收敛为
+`CANCELED`；超时后也可以再次调用 `cancel_job` 重试停止。
+
 ```bash
 curl -X POST http://127.0.0.1:27190/mcp \
   -H "Content-Type: application/json" \

@@ -142,6 +142,7 @@ class ScriptExecuteActivity : AppCompatActivity() {
         private val mScriptEngineManager: ScriptEngineManager,
         task: ScriptExecutionTask?
     ) : AbstractScriptExecution(task) {
+        @Volatile
         private var mScriptEngine: ScriptEngine<*>? = null
         fun createEngine(activity: Activity?): ScriptEngine<*> {
             mScriptEngine?.forceStop()
