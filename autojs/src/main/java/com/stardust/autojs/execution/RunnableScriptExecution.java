@@ -17,7 +17,7 @@ import org.mozilla.javascript.ContinuationPending;
 public class RunnableScriptExecution extends ScriptExecution.AbstractScriptExecution implements Runnable {
 
     private static final String TAG = "RunnableJSExecution";
-    private ScriptEngine mScriptEngine;
+    private volatile ScriptEngine mScriptEngine;
     private ScriptEngineManager mScriptEngineManager;
 
     public RunnableScriptExecution(ScriptEngineManager manager, ScriptExecutionTask task) {

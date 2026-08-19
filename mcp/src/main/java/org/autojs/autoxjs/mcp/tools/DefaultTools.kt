@@ -9,11 +9,16 @@ import org.autojs.autoxjs.mcp.McpResponse
 import org.autojs.autoxjs.mcp.tool.McpTool
 import com.google.gson.Gson
 import com.google.gson.JsonObject
+import com.stardust.autojs.execution.ScriptExecution
 import com.stardust.autojs.servicecomponents.BinderScriptListener
 import com.stardust.autojs.servicecomponents.EngineController
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.ArrayDeque
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 private val gson = Gson()
 
@@ -112,20 +117,32 @@ class RunScriptTool(
         tmp.writeText(request.script)
         val listener = object : BinderScriptListener {
             override fun onStart(taskInfo: com.stardust.autojs.servicecomponents.TaskInfo) {
-                tracker.update(job.jobId, JobStatus.Status.RUNNING, "started")
+                tracker.markRunning(job.jobId, "started")
             }
 
             override fun onSuccess(taskInfo: com.stardust.autojs.servicecomponents.TaskInfo) {
-                tracker.update(job.jobId, JobStatus.Status.SUCCESS, "completed")
+                tracker.markSuccess(job.jobId, "completed")
                 tmp.delete()
             }
 
             override fun onException(taskInfo: com.stardust.autojs.servicecomponents.TaskInfo, e: Throwable) {
-                tracker.update(job.jobId, JobStatus.Status.FAILED, e.message)
+                tracker.markFailed(job.jobId, e.message)
                 tmp.delete()
             }
         }
-        EngineController.runScript(tmp, listener, null)
+        val execution = try {
+            EngineController.runScriptLocalTracked(tmp, listener, null)
+        } catch (e: Throwable) {
+            tracker.markFailed(job.jobId, e.message)
+            tmp.delete()
+            return McpResponse.error("Failed", "failed to start script: ${e.message}")
+        }
+        tracker.attachCancellation(
+            job.jobId,
+            ScriptExecutionCancellation(execution) {
+                tracker.markCanceled(job.jobId, "engine stopped after cancellation timeout")
+            }
+        )
         return McpResponse.ok(mapOf("jobId" to job.jobId))
     }
 }
@@ -147,10 +164,56 @@ class CancelJobTool(
     override suspend fun handle(params: JsonObject?): McpResponse {
         val jobId = params?.get("jobId")?.asInt
             ?: return McpResponse.error("BadRequest", "jobId is required")
-        tracker.update(jobId, JobStatus.Status.CANCELED, "requested cancel")
-        // Fallback: stop all scripts if needed (coarse-grained).
-        EngineController.stopAllScript()
-        return McpResponse.ok(mapOf("jobId" to jobId, "status" to "CANCELED"))
+        return when (val request = tracker.requestCancel(jobId)) {
+            CancelRequest.NotFound -> McpResponse.error("NotFound", "job not found")
+            CancelRequest.NotReady -> McpResponse.error("NotReady", "job is not ready to cancel")
+            CancelRequest.InProgress -> McpResponse.error(
+                "CancelInProgress",
+                "job cancellation is already in progress"
+            )
+            is CancelRequest.AlreadyFinished -> McpResponse.error(
+                "AlreadyFinished",
+                "job already finished with status ${request.status}"
+            )
+            CancelRequest.AlreadyCanceled -> McpResponse.ok(
+                mapOf("jobId" to jobId, "status" to "CANCELED")
+            )
+            is CancelRequest.Ready -> {
+                val stopped = try {
+                    request.cancellation.cancelAndAwait(CANCEL_TIMEOUT_MILLIS)
+                } catch (e: Throwable) {
+                    tracker.restoreAfterCancelFailure(jobId, "cancel failed: ${e.message}")
+                    if (tracker.get(jobId)?.status == JobStatus.Status.CANCELED) {
+                        return McpResponse.ok(mapOf("jobId" to jobId, "status" to "CANCELED"))
+                    }
+                    return McpResponse.error(
+                        "CancelFailed",
+                        "failed to stop script engine: ${e.message}"
+                    )
+                }
+                if (!stopped) {
+                    tracker.finishCancelAttemptAfterTimeout(jobId)
+                    if (tracker.get(jobId)?.status == JobStatus.Status.CANCELED) {
+                        return McpResponse.ok(mapOf("jobId" to jobId, "status" to "CANCELED"))
+                    }
+                    McpResponse.error(
+                        "CancelTimeout",
+                        "script engine did not stop within ${CANCEL_TIMEOUT_MILLIS}ms"
+                    )
+                } else {
+                    tracker.markCanceled(jobId, "engine stopped")
+                    if (tracker.get(jobId)?.status == JobStatus.Status.CANCELED) {
+                        McpResponse.ok(mapOf("jobId" to jobId, "status" to "CANCELED"))
+                    } else {
+                        McpResponse.error("CancelFailed", "job state changed before cancellation completed")
+                    }
+                }
+            }
+        }
+    }
+
+    private companion object {
+        const val CANCEL_TIMEOUT_MILLIS = 5_000L
     }
 }
 
@@ -265,19 +328,90 @@ class RunScriptFileTool(
         val job = tracker.newJob(request.name ?: file.nameWithoutExtension)
         val listener = object : BinderScriptListener {
             override fun onStart(taskInfo: com.stardust.autojs.servicecomponents.TaskInfo) {
-                tracker.update(job.jobId, JobStatus.Status.RUNNING, "started")
+                tracker.markRunning(job.jobId, "started")
             }
 
             override fun onSuccess(taskInfo: com.stardust.autojs.servicecomponents.TaskInfo) {
-                tracker.update(job.jobId, JobStatus.Status.SUCCESS, "completed")
+                tracker.markSuccess(job.jobId, "completed")
             }
 
             override fun onException(taskInfo: com.stardust.autojs.servicecomponents.TaskInfo, e: Throwable) {
-                tracker.update(job.jobId, JobStatus.Status.FAILED, e.message)
+                tracker.markFailed(job.jobId, e.message)
             }
         }
-        EngineController.runScript(file, listener, null)
+        val execution = try {
+            EngineController.runScriptLocalTracked(file, listener, null)
+        } catch (e: Throwable) {
+            tracker.markFailed(job.jobId, e.message)
+            return McpResponse.error("Failed", "failed to start script: ${e.message}")
+        }
+        tracker.attachCancellation(
+            job.jobId,
+            ScriptExecutionCancellation(execution) {
+                tracker.markCanceled(job.jobId, "engine stopped after cancellation timeout")
+            }
+        )
         return McpResponse.ok(mapOf("jobId" to job.jobId, "path" to file.absolutePath))
+    }
+}
+
+private class ScriptExecutionCancellation(
+    private val execution: ScriptExecution,
+    private val onDelayedStop: () -> Unit
+) : JobCancellation {
+    private val stopRequested = AtomicBoolean(false)
+    private val delayedObserverStarted = AtomicBoolean(false)
+
+    override suspend fun cancelAndAwait(timeoutMillis: Long): Boolean {
+        val stopped = withTimeoutOrNull(timeoutMillis) {
+            while (true) {
+                val engine = execution.engine
+                if (engine != null) {
+                    if (engine.isDestroyed) {
+                        return@withTimeoutOrNull true
+                    }
+                    if (stopRequested.compareAndSet(false, true)) {
+                        try {
+                            engine.forceStop()
+                        } catch (e: Throwable) {
+                            stopRequested.set(false)
+                            throw e
+                        }
+                    }
+                }
+                delay(25)
+            }
+            @Suppress("UNREACHABLE_CODE")
+            false
+        } ?: false
+        if (!stopped) {
+            stopRequested.set(false)
+            observeDelayedStop()
+        }
+        return stopped
+    }
+
+    private fun observeDelayedStop() {
+        if (!delayedObserverStarted.compareAndSet(false, true)) {
+            return
+        }
+        EngineController.scope.launch {
+            val stopped = withTimeoutOrNull(DELAYED_STOP_OBSERVE_MILLIS) {
+                while (execution.engine?.isDestroyed != true) {
+                    delay(100)
+                }
+                true
+            } ?: false
+            if (stopped) {
+                onDelayedStop()
+            } else {
+                delayedObserverStarted.set(false)
+            }
+        }
+    }
+
+    private companion object {
+        const val DELAYED_STOP_OBSERVE_MILLIS = 60_000L
     }
 }
 
